@@ -594,6 +594,77 @@ func (dec *Decoder) Literal(ptr *string) bool {
 	return dec.returnErr(err)
 }
 
+// LiteralTooLongError is returned by Decoder.LiteralMax when a literal
+// declares a size exceeding the maximum.
+type LiteralTooLongError struct {
+	Size int64
+	Max  int64
+}
+
+func (err *LiteralTooLongError) Error() string {
+	return fmt.Sprintf("imapwire: literal size %v exceeds the maximum of %v bytes", err.Size, err.Max)
+}
+
+// LiteralUnexpectedEOFError is returned by Decoder.LiteralMax when the input
+// ends before the full declared literal has been read.
+type LiteralUnexpectedEOFError struct {
+	// Size is the declared literal size.
+	Size int64
+	// N is the number of literal bytes that have been read.
+	N int64
+	// Remaining is the number of declared literal bytes which are missing.
+	Remaining int64
+}
+
+func (err *LiteralUnexpectedEOFError) Error() string {
+	return fmt.Sprintf("imapwire: unexpected EOF in literal: read %v of %v bytes, %v remaining", err.N, err.Size, err.Remaining)
+}
+
+func (err *LiteralUnexpectedEOFError) Unwrap() error {
+	return io.ErrUnexpectedEOF
+}
+
+// LiteralMax decodes a literal of at most max bytes into ptr.
+//
+// Unlike Literal, it does not use CheckBufferedLiteralFunc: the declared size
+// is checked against max before any bytes are read and before any buffer is
+// allocated. If the declared size is greater than max, the literal is
+// rejected and the decoder error is set to *LiteralTooLongError.
+//
+// The literal bytes are read according to the declared size, so any
+// following response data is never consumed as part of the literal. If the
+// input ends in the middle of the literal, the decoder error is set to
+// *LiteralUnexpectedEOFError, which reports the number of missing bytes.
+//
+// It returns false if the next field is not a literal, without setting the
+// decoder error.
+func (dec *Decoder) LiteralMax(ptr *string, max int64) bool {
+	lit, _, ok := dec.LiteralReader()
+	if !ok {
+		return false
+	}
+	size := lit.Size()
+	if size > max {
+		lit.cancel()
+		return dec.returnErr(&LiteralTooLongError{Size: size, Max: max})
+	}
+	buf := make([]byte, size)
+	n, err := io.ReadFull(lit, buf)
+	if err != nil {
+		if err == io.ErrUnexpectedEOF || err == io.EOF {
+			return dec.returnErr(&LiteralUnexpectedEOFError{
+				Size:      size,
+				N:         int64(n),
+				Remaining: size - int64(n),
+			})
+		}
+		return dec.returnErr(err)
+	}
+	lit.cancel()
+	*ptr = string(buf)
+	return true
+}
+
 func (dec *Decoder) LiteralReader() (lit *LiteralReader, nonSync, ok bool) {
 	if !dec.Special('{') {
 		return nil, false, false
