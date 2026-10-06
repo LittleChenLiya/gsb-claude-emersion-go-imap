@@ -31,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -161,7 +162,7 @@ type Client struct {
 	pendingCapCh chan struct{}
 	mailbox      *SelectedMailbox
 	cmdTag       uint64
-	pendingCmds  []command
+	tracker      commandTracker
 	contReqs     []continuationRequest
 	closed       bool
 }
@@ -436,7 +437,7 @@ func (c *Client) beginCommand(name string, cmd command) *commandEncoder {
 		done: make(chan error, 1),
 	}
 
-	c.pendingCmds = append(c.pendingCmds, cmd)
+	c.tracker.register(cmd)
 	quotedUTF8 := c.caps.Has(imap.CapIMAP4rev2) || c.enabled.Has(imap.CapUTF8Accept)
 	literalMinus := c.caps.Has(imap.CapLiteralMinus)
 	literalPlus := c.caps.Has(imap.CapLiteralPlus)
@@ -465,103 +466,19 @@ func (c *Client) beginCommand(name string, cmd command) *commandEncoder {
 func (c *Client) deletePendingCmdByTag(tag string) command {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
-
-	for i, cmd := range c.pendingCmds {
-		if cmd.base().tag == tag {
-			c.pendingCmds = append(c.pendingCmds[:i], c.pendingCmds[i+1:]...)
-			return cmd
-		}
-	}
-	return nil
+	return c.tracker.deleteByTag(tag)
 }
 
 func (c *Client) findPendingCmdFunc(f func(cmd command) bool) command {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
-
-	for _, cmd := range c.pendingCmds {
-		if f(cmd) {
-			return cmd
-		}
-	}
-	return nil
+	return c.tracker.findFunc(f)
 }
 
 func findPendingCmdByType[T command](c *Client) T {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
-
-	for _, cmd := range c.pendingCmds {
-		if cmd, ok := cmd.(T); ok {
-			return cmd
-		}
-	}
-
-	var cmd T
-	return cmd
-}
-
-func (c *Client) completeCommand(cmd command, err error) {
-	done := cmd.base().done
-	done <- err
-	close(done)
-
-	// Ensure the command is not blocked waiting on continuation requests
-	c.mutex.Lock()
-	var filtered []continuationRequest
-	for _, contReq := range c.contReqs {
-		if contReq.cmd != cmd.base() {
-			filtered = append(filtered, contReq)
-		} else {
-			contReq.Cancel(err)
-		}
-	}
-	c.contReqs = filtered
-	c.mutex.Unlock()
-
-	switch cmd := cmd.(type) {
-	case *authenticateCommand, *loginCommand:
-		if err == nil {
-			c.setState(imap.ConnStateAuthenticated)
-		}
-	case *unauthenticateCommand:
-		if err == nil {
-			c.mutex.Lock()
-			c.state = imap.ConnStateNotAuthenticated
-			c.mailbox = nil
-			c.enabled = make(imap.CapSet)
-			c.mutex.Unlock()
-		}
-	case *SelectCommand:
-		if err == nil {
-			c.mutex.Lock()
-			c.state = imap.ConnStateSelected
-			c.mailbox = &SelectedMailbox{
-				Name:           cmd.mailbox,
-				NumMessages:    cmd.data.NumMessages,
-				Flags:          cmd.data.Flags,
-				PermanentFlags: cmd.data.PermanentFlags,
-			}
-			c.mutex.Unlock()
-		}
-	case *unselectCommand:
-		if err == nil {
-			c.setState(imap.ConnStateAuthenticated)
-		}
-	case *logoutCommand:
-		if err == nil {
-			c.setState(imap.ConnStateLogout)
-		}
-	case *ListCommand:
-		if cmd.pendingData != nil {
-			cmd.mailboxes <- cmd.pendingData
-		}
-		close(cmd.mailboxes)
-	case *FetchCommand:
-		close(cmd.msgs)
-	case *ExpungeCommand:
-		close(cmd.seqNums)
-	}
+	return findTrackedCmdByType[T](&c.tracker)
 }
 
 func (c *Client) registerContReq(cmd command) *imapwire.ContinuationRequest {
@@ -582,8 +499,7 @@ func (c *Client) closeWithError(err error) {
 
 	c.mutex.Lock()
 	c.state = imap.ConnStateLogout
-	pendingCmds := c.pendingCmds
-	c.pendingCmds = nil
+	pendingCmds := c.tracker.drain(nil)
 	c.mutex.Unlock()
 
 	for _, cmd := range pendingCmds {
@@ -949,6 +865,17 @@ func (c *Client) readResponseData(typ string) error {
 			}
 			close(c.greetingCh)
 		}
+
+		if typ == "BYE" {
+			// resp-cond-bye: the server is terminating the connection.
+			// Undecided commands will never receive a tagged completion:
+			// terminate them all, exactly once.
+			c.abortPendingCommands(&imap.Error{
+				Type: imap.StatusResponseTypeBye,
+				Code: imap.ResponseCode(code),
+				Text: text,
+			})
+		}
 	case "ID":
 		return c.handleID()
 	case "CAPABILITY":
@@ -1235,6 +1162,9 @@ type commandBase struct {
 	tag  string
 	done chan error
 	err  error
+	// completed ensures a command is finished exactly once, even if both
+	// an untagged BYE and a connection close try to terminate it.
+	completed atomic.Bool
 }
 
 func (cmd *commandBase) base() *commandBase {
