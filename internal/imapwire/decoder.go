@@ -594,6 +594,41 @@ func (dec *Decoder) Literal(ptr *string) bool {
 	return dec.returnErr(err)
 }
 
+// LiteralLimited reads a literal value into *ptr, rejecting literals whose
+// declared size exceeds maxSize before any memory for their contents is
+// allocated.
+//
+// The literal header is decoded with the regular IMAP grammar. If the input
+// ends before the declared number of bytes has been read, the decoder error
+// reports how many bytes are missing; the unread remainder of the literal is
+// never mistaken for a subsequent response.
+func (dec *Decoder) LiteralLimited(ptr *string, maxSize int64) bool {
+	lit, nonSync, ok := dec.LiteralReader()
+	if !ok {
+		return false
+	}
+	if dec.CheckBufferedLiteralFunc != nil {
+		if err := dec.CheckBufferedLiteralFunc(lit.Size(), nonSync); err != nil {
+			lit.cancel()
+			return false
+		}
+	}
+	if lit.Size() > maxSize {
+		lit.cancel()
+		return dec.returnErr(fmt.Errorf("imapwire: literal size %d exceeds maximum allowed size %d", lit.Size(), maxSize))
+	}
+	var sb strings.Builder
+	n, err := io.Copy(&sb, lit)
+	if err != nil {
+		return dec.returnErr(err)
+	}
+	if n < lit.Size() {
+		return dec.returnErr(fmt.Errorf("imapwire: premature EOF reading literal: %d of %d bytes read, %d remaining", n, lit.Size(), lit.Size()-n))
+	}
+	*ptr = sb.String()
+	return true
+}
+
 func (dec *Decoder) LiteralReader() (lit *LiteralReader, nonSync, ok bool) {
 	if !dec.Special('{') {
 		return nil, false, false
