@@ -46,11 +46,16 @@ func readCapabilities(dec *imapwire.Decoder) (imap.CapSet, error) {
 		for dec.SP() {
 		}
 
-		cap, err := internal.ExpectCap(dec)
+		// Preserve the original spelling: capability names are
+		// case-insensitive and CapSet lookups fold case.
+		cap, err := internal.ExpectCapRaw(dec)
 		if err != nil {
-			return caps, fmt.Errorf("in capability-data: %w", err)
+			// Don't return a partially populated set: the caller must
+			// only apply the new capabilities once a whole CAPABILITY
+			// response has been successfully parsed.
+			return nil, fmt.Errorf("in capability-data: %w", err)
 		}
-		caps[cap] = struct{}{}
+		caps.Add(cap)
 	}
 	return caps, nil
 }

@@ -99,11 +99,60 @@ func AuthCap(mechanism string) Cap {
 }
 
 // CapSet is a set of capabilities.
+//
+// The set preserves the original spelling of capabilities as advertised by
+// the server, while lookups (Has, Find) are case-insensitive as mandated by
+// the IMAP specifications. Parameterized capabilities (e.g. "AUTH=PLAIN")
+// are matched on both their name and parameter, case-insensitively.
 type CapSet map[Cap]struct{}
 
 func (set CapSet) has(c Cap) bool {
 	_, ok := set[c]
 	return ok
+}
+
+// splitCapParam splits a capability into its name and parameter, separated
+// by the first "=". ok is false if the capability has no parameter.
+func splitCapParam(c Cap) (name, param string, ok bool) {
+	s := string(c)
+	i := strings.IndexByte(s, '=')
+	if i < 0 {
+		return s, "", false
+	}
+	return s[:i], s[i+1:], true
+}
+
+// capNamesEqualFold reports whether two capabilities are equal,
+// case-insensitively. For parameterized capabilities (e.g. "AUTH=PLAIN"),
+// both the name and the parameter are compared case-insensitively.
+func capNamesEqualFold(a, b Cap) bool {
+	return strings.EqualFold(string(a), string(b))
+}
+
+// Add inserts a capability into the set.
+//
+// Capability names are case-insensitive: if a capability which only differs
+// by case is already present in the set, the original spelling is kept and
+// the duplicate is dropped.
+func (set CapSet) Add(c Cap) {
+	if _, ok := set.Find(c); ok {
+		return
+	}
+	set[c] = struct{}{}
+}
+
+// Find returns the capability as stored in the set, preserving its original
+// spelling. The lookup is case-insensitive.
+func (set CapSet) Find(c Cap) (Cap, bool) {
+	if set.has(c) {
+		return c, true
+	}
+	for stored := range set {
+		if capNamesEqualFold(stored, c) {
+			return stored, true
+		}
+	}
+	return "", false
 }
 
 func (set CapSet) Copy() CapSet {
@@ -116,24 +165,27 @@ func (set CapSet) Copy() CapSet {
 
 // Has checks whether a capability is supported.
 //
+// The lookup is case-insensitive: a capability advertised by the server with
+// a different casing still matches.
+//
 // Some capabilities are implied by others, as such Has may return true even if
 // the capability is not in the map.
 func (set CapSet) Has(c Cap) bool {
-	if set.has(c) {
+	if _, ok := set.Find(c); ok {
 		return true
 	}
 
-	if set.has(CapIMAP4rev2) && imap4rev2Caps.has(c) {
+	if _, ok := set.Find(CapIMAP4rev2); ok && imap4rev2Caps.has(c) {
 		return true
 	}
 
-	if c == CapLiteralMinus && set.has(CapLiteralPlus) {
+	if c == CapLiteralMinus && set.Has(CapLiteralPlus) {
 		return true
 	}
-	if c == CapCondStore && set.has(CapQResync) {
+	if c == CapCondStore && set.Has(CapQResync) {
 		return true
 	}
-	if c == CapUTF8Accept && set.has(CapUTF8Only) {
+	if c == CapUTF8Accept && set.Has(CapUTF8Only) {
 		return true
 	}
 	if c == CapAppendLimit {
@@ -146,14 +198,17 @@ func (set CapSet) Has(c Cap) bool {
 
 // AuthMechanisms returns the list of supported SASL mechanisms for
 // authentication.
+//
+// The "AUTH=" capability name is matched case-insensitively, while each
+// returned mechanism keeps its original spelling.
 func (set CapSet) AuthMechanisms() []string {
 	var l []string
 	for c := range set {
-		if !strings.HasPrefix(string(c), "AUTH=") {
+		name, param, ok := splitCapParam(c)
+		if !ok || !strings.EqualFold(name, "AUTH") {
 			continue
 		}
-		mech := strings.TrimPrefix(string(c), "AUTH=")
-		l = append(l, mech)
+		l = append(l, param)
 	}
 	return l
 }
@@ -164,17 +219,17 @@ func (set CapSet) AuthMechanisms() []string {
 // the same upload limit for all mailboxes, limit is nil and per-mailbox
 // limits must be queried via STATUS.
 func (set CapSet) AppendLimit() (limit *uint32, ok bool) {
-	if set.has(CapAppendLimit) {
+	if _, found := set.Find(CapAppendLimit); found {
 		return nil, true
 	}
 
 	for c := range set {
-		if !strings.HasPrefix(string(c), "APPENDLIMIT=") {
+		name, param, isParam := splitCapParam(c)
+		if !isParam || !strings.EqualFold(name, "APPENDLIMIT") {
 			continue
 		}
 
-		limitStr := strings.TrimPrefix(string(c), "APPENDLIMIT=")
-		limit64, err := strconv.ParseUint(limitStr, 10, 32)
+		limit64, err := strconv.ParseUint(param, 10, 32)
 		if err == nil && limit64 > 0 {
 			limit32 := uint32(limit64)
 			return &limit32, true
@@ -189,11 +244,14 @@ func (set CapSet) AppendLimit() (limit *uint32, ok bool) {
 func (set CapSet) QuotaResourceTypes() []QuotaResourceType {
 	var l []QuotaResourceType
 	for c := range set {
-		if !strings.HasPrefix(string(c), "QUOTA=RES-") {
+		name, param, ok := splitCapParam(c)
+		if !ok || !strings.EqualFold(name, "QUOTA") {
 			continue
 		}
-		t := strings.TrimPrefix(string(c), "QUOTA=RES-")
-		l = append(l, QuotaResourceType(t))
+		if len(param) < 4 || !strings.EqualFold(param[:4], "RES-") {
+			continue
+		}
+		l = append(l, QuotaResourceType(param[4:]))
 	}
 	return l
 }
@@ -202,11 +260,11 @@ func (set CapSet) QuotaResourceTypes() []QuotaResourceType {
 func (set CapSet) ThreadAlgorithms() []ThreadAlgorithm {
 	var l []ThreadAlgorithm
 	for c := range set {
-		if !strings.HasPrefix(string(c), "THREAD=") {
+		name, param, ok := splitCapParam(c)
+		if !ok || !strings.EqualFold(name, "THREAD") {
 			continue
 		}
-		alg := strings.TrimPrefix(string(c), "THREAD=")
-		l = append(l, ThreadAlgorithm(alg))
+		l = append(l, ThreadAlgorithm(param))
 	}
 	return l
 }

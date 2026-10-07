@@ -70,11 +70,23 @@ func ExpectFlagList(dec *imapwire.Decoder) ([]imap.Flag, error) {
 }
 
 func ExpectCap(dec *imapwire.Decoder) (imap.Cap, error) {
+	c, err := ExpectCapRaw(dec)
+	if err != nil {
+		return "", err
+	}
+	return canonicalCap(string(c)), nil
+}
+
+// ExpectCapRaw reads a capability, preserving its original spelling.
+//
+// Capability names are case-insensitive, so callers are expected to compare
+// them case-insensitively (e.g. via imap.CapSet).
+func ExpectCapRaw(dec *imapwire.Decoder) (imap.Cap, error) {
 	var name string
 	if !dec.ExpectAtom(&name) {
 		return "", dec.Err()
 	}
-	return canonicalCap(name), nil
+	return imap.Cap(name), nil
 }
 
 func ExpectFlag(dec *imapwire.Decoder) (imap.Flag, error) {
