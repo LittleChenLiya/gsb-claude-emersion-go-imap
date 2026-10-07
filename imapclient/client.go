@@ -156,7 +156,7 @@ type Client struct {
 
 	mutex        sync.Mutex
 	state        imap.ConnState
-	caps         imap.CapSet
+	caps         *imap.Caps
 	enabled      imap.CapSet
 	pendingCapCh chan struct{}
 	mailbox      *SelectedMailbox
@@ -313,6 +313,16 @@ func (c *Client) setState(state imap.ConnState) {
 // and block until it's received. If the capabilities cannot be fetched, nil is
 // returned.
 func (c *Client) Caps() imap.CapSet {
+	return c.CapView().CapSet()
+}
+
+// CapView returns the capabilities advertised by the server as a
+// case-insensitive view which preserves their original spelling.
+//
+// When the server hasn't sent the capability list, this method will request it
+// and block until it's received. If the capabilities cannot be fetched, nil is
+// returned.
+func (c *Client) CapView() *imap.Caps {
 	if err := c.WaitGreeting(); err != nil {
 		return nil
 	}
@@ -353,7 +363,7 @@ func (c *Client) Caps() imap.CapSet {
 	return c.caps
 }
 
-func (c *Client) setCaps(caps imap.CapSet) {
+func (c *Client) setCaps(caps *imap.Caps) {
 	// If the capabilities are being reset, request the updated capabilities
 	// from the server
 	var capCh chan struct{}
@@ -1028,6 +1038,13 @@ func (c *Client) readResponseData(typ string) error {
 
 // WaitGreeting waits for the server's initial greeting.
 func (c *Client) WaitGreeting() error {
+	// If the greeting has already been received, don't report a
+	// connection error which happened afterwards
+	select {
+	case <-c.greetingCh:
+		return c.greetingErr
+	default:
+	}
 	select {
 	case <-c.greetingCh:
 		return c.greetingErr

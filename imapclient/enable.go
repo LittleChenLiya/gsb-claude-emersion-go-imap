@@ -40,13 +40,13 @@ func (c *Client) handleEnabled() error {
 	}
 
 	c.mutex.Lock()
-	for name := range caps {
+	for name := range caps.CapSet() {
 		c.enabled[name] = struct{}{}
 	}
 	c.mutex.Unlock()
 
 	if cmd := findPendingCmdByType[*EnableCommand](c); cmd != nil {
-		cmd.data.Caps = caps
+		cmd.data.Caps = caps.CapSet()
 	}
 
 	return nil
