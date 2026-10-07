@@ -5,6 +5,7 @@ import (
 	"io"
 	netmail "net/mail"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -594,6 +595,182 @@ func (buf *FetchMessageBuffer) FindBinarySectionSize(part []int) (uint32, bool) 
 		}
 	}
 	return 0, false
+}
+
+// SeqUIDStatus describes the association state between a message sequence
+// number and a UID in a SeqUIDTracker.
+type SeqUIDStatus int
+
+const (
+	// SeqUIDUnknown indicates that no FETCH response has been recorded for
+	// the sequence number.
+	SeqUIDUnknown SeqUIDStatus = iota
+	// SeqUIDUnbound indicates that a FETCH response without a UID item has
+	// been recorded for the sequence number.
+	SeqUIDUnbound
+	// SeqUIDBound indicates that the sequence number is associated with a
+	// UID.
+	SeqUIDBound
+)
+
+func (status SeqUIDStatus) String() string {
+	switch status {
+	case SeqUIDUnknown:
+		return "unknown"
+	case SeqUIDUnbound:
+		return "unbound"
+	case SeqUIDBound:
+		return "bound"
+	default:
+		return fmt.Sprintf("SeqUIDStatus(%d)", int(status))
+	}
+}
+
+// SeqUIDTracker tracks the association between server message sequence
+// numbers and UIDs, as reported by FETCH and EXPUNGE responses.
+//
+// Sequence numbers and UIDs are kept in two separate indexes: a sequence
+// number is never used as a UID key, nor the other way around.
+//
+// The tracker is fed from the existing Fetch API: call Update or
+// UpdateBuffer for each received FETCH response, and Expunge for each
+// received EXPUNGE response (e.g. obtained via ExpungeCommand or
+// UnilateralDataHandler.Expunge).
+//
+// A SeqUIDTracker is safe for concurrent use.
+type SeqUIDTracker struct {
+	mutex   sync.Mutex
+	bySeq   map[uint32]imap.UID
+	byUID   map[imap.UID]uint32
+	unbound map[uint32]struct{}
+}
+
+// NewSeqUIDTracker creates a new SeqUIDTracker.
+func NewSeqUIDTracker() *SeqUIDTracker {
+	return &SeqUIDTracker{
+		bySeq:   make(map[uint32]imap.UID),
+		byUID:   make(map[imap.UID]uint32),
+		unbound: make(map[uint32]struct{}),
+	}
+}
+
+// Update records the association between a message sequence number and a
+// UID, as reported by a FETCH response.
+//
+// A zero UID indicates that the FETCH response didn't contain a UID item:
+// the sequence number is recorded as unbound.
+func (t *SeqUIDTracker) Update(seqNum uint32, uid imap.UID) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	if prev, ok := t.bySeq[seqNum]; ok {
+		delete(t.byUID, prev)
+	}
+	if uid == 0 {
+		delete(t.bySeq, seqNum)
+		t.unbound[seqNum] = struct{}{}
+		return
+	}
+
+	delete(t.unbound, seqNum)
+	if prevSeq, ok := t.byUID[uid]; ok {
+		delete(t.bySeq, prevSeq)
+	}
+	t.bySeq[seqNum] = uid
+	t.byUID[uid] = seqNum
+}
+
+// UpdateBuffer records the association reported by a fetched message.
+//
+// This is a convenience wrapper around Update for use with
+// FetchMessageBuffer values obtained via FetchCommand.Collect.
+func (t *SeqUIDTracker) UpdateBuffer(buf *FetchMessageBuffer) {
+	t.Update(buf.SeqNum, buf.UID)
+}
+
+// Expunge records an EXPUNGE response for a message sequence number.
+//
+// The association for the expunged message is dropped, and the sequence
+// numbers of all messages after it are decremented by one, as mandated by
+// the IMAP protocol.
+func (t *SeqUIDTracker) Expunge(seqNum uint32) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	if uid, ok := t.bySeq[seqNum]; ok {
+		delete(t.byUID, uid)
+		delete(t.bySeq, seqNum)
+	}
+	delete(t.unbound, seqNum)
+
+	// Sequence numbers after the expunged message are decremented by one
+	var shifted []uint32
+	for seq := range t.bySeq {
+		if seq > seqNum {
+			shifted = append(shifted, seq)
+		}
+	}
+	for _, seq := range shifted {
+		uid := t.bySeq[seq]
+		delete(t.bySeq, seq)
+		t.bySeq[seq-1] = uid
+		t.byUID[uid] = seq - 1
+	}
+
+	shifted = shifted[:0]
+	for seq := range t.unbound {
+		if seq > seqNum {
+			shifted = append(shifted, seq)
+		}
+	}
+	for _, seq := range shifted {
+		delete(t.unbound, seq)
+		t.unbound[seq-1] = struct{}{}
+	}
+}
+
+// Status returns the association state of a message sequence number.
+func (t *SeqUIDTracker) Status(seqNum uint32) SeqUIDStatus {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	if _, ok := t.bySeq[seqNum]; ok {
+		return SeqUIDBound
+	}
+	if _, ok := t.unbound[seqNum]; ok {
+		return SeqUIDUnbound
+	}
+	return SeqUIDUnknown
+}
+
+// UID returns the UID associated with a message sequence number.
+//
+// If the sequence number is unknown or unbound, ok is false.
+func (t *SeqUIDTracker) UID(seqNum uint32) (uid imap.UID, ok bool) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	uid, ok = t.bySeq[seqNum]
+	return uid, ok
+}
+
+// SeqNum returns the message sequence number associated with a UID.
+//
+// If the UID is unknown, ok is false.
+func (t *SeqUIDTracker) SeqNum(uid imap.UID) (seqNum uint32, ok bool) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	seqNum, ok = t.byUID[uid]
+	return seqNum, ok
+}
+
+// Len returns the number of bound sequence number/UID associations.
+func (t *SeqUIDTracker) Len() int {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	return len(t.bySeq)
 }
 
 func (c *Client) handleFetch(seqNum uint32) error {
